@@ -40,7 +40,7 @@ No installation required. Just a modern web browser:
 ```
 rbrizz-distance-map/
 ├── rbrizz_distance_map.html   # Main application file
-├── iconrb.png                 # RBRIZZ logo (header icon)
+├── iconrb.png                 # RobotRizz logo (header icon)
 └── GameField/                 # Field image assets
     ├── 2026/
     │   ├── Elementary.png
