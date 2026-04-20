@@ -1,4 +1,4 @@
-# 🗺️ RBRIZZ Distance Map
+# 🗺️ OdomMap
 
 <div align="center">
 
@@ -38,8 +38,8 @@ No installation required. Just a modern web browser:
 ### 📂 File Structure
 
 ```
-rbrizz-distance-map/
-├── rbrizz_distance_map.html   # Main application file
+OdomMap/
+├── OdomMap.html               # Main application file
 ├── iconrb.png                 # RobotRizz logo (header icon)
 └── GameField/                 # Field image assets
     ├── 2026/
@@ -56,7 +56,7 @@ rbrizz-distance-map/
 
 1. **Clone or download** this repository
 2. Place your field images inside `GameField/<year>/` as `<Category>.png`
-3. Open `rbrizz_distance_map.html` directly in your browser
+3. Open `OdomMap.html` directly in your browser
 
 > ⚡ No server needed — it runs entirely client-side!
 
