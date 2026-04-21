@@ -421,6 +421,15 @@
                     <button class="btn btn-secondary" id="btn-add-odometry-point" style="flex:1; padding: 6px;">Add Point</button>
                     <button class="btn btn-secondary" id="btn-add-odometry-line" style="flex:1; padding: 6px;">Add Line</button>
                 </div>
+                <div style="margin-top: 10px; display: flex; gap: 5px;">
+                    <button class="btn btn-primary" id="btn-record" style="flex:1; padding: 6px;">Record</button>
+                    <button class="btn btn-danger" id="btn-stop" style="flex:1; padding: 6px;" disabled>Stop</button>
+                </div>
+                <div id="record-output" style="margin-top: 10px; display: none;">
+                    <label style="font-size: 0.85rem; color: #ffffff;">Python Output:</label>
+                    <textarea id="python-output" readonly style="width: 100%; height: 80px; margin-top: 5px; background: #1a1a2e; color: #4dd0e1; border: 1px solid #0f3460; border-radius: 5px; font-family: monospace; font-size: 0.8rem; resize: none;"></textarea>
+                    <button class="btn btn-secondary" id="btn-copy" style="margin-top: 5px; padding: 5px;">Copy to Clipboard</button>
+                </div>
                 <div style="margin-top: 10px;">
                     <label style="font-size: 0.85rem; color: #ffffff;">Grid Opacity: <span id="grid-opacity-value">40%</span></label>
                     <input type="range" id="grid-opacity-slider" min="0" max="100" value="40" style="width: 100%; margin-top: 4px;">
@@ -532,6 +541,10 @@
         let odometryPoints = [];
         let odometryLines = [];
         let odometryAddMode = null; // 'point' or 'line'
+
+        // Recording state
+        let isRecording = false;
+        let recordedPoints = [];
 
         // Colors
         const COLORS = {
@@ -801,6 +814,35 @@
 
             // Draw odometry lines (thinner, red like hover)
             odometryLines.forEach(odoLine => {
+                // Draw triangle legs if enabled
+                if (showTriangle) {
+                    const hPoint = { x: odoLine.end.x, y: odoLine.start.y };
+                    const vPoint = { x: odoLine.start.x, y: odoLine.end.y };
+
+                    // Horizontal leg with outline
+                    drawLineWithOutline(odoLine.start.x, odoLine.start.y, hPoint.x, hPoint.y, COLORS.triangleLegs, 4, 7);
+
+                    // Vertical leg with outline
+                    drawLineWithOutline(odoLine.start.x, odoLine.start.y, vPoint.x, vPoint.y, COLORS.triangleLegs, 4, 7);
+
+                    // Leg distance labels
+                    if (showLegs) {
+                        const hDist = Math.abs(toMM(odoLine.end.x - odoLine.start.x));
+                        const vDist = Math.abs(toMM(odoLine.end.y - odoLine.start.y));
+
+                        // Horizontal leg distance
+                        const labelX = (odoLine.start.x + hPoint.x) / 2;
+                        drawTextWithOutline(Math.round(hDist) + 'mm', labelX, odoLine.start.y - 12, 14, '#ff0000');
+
+                        // Vertical leg distance
+                        ctx.save();
+                        ctx.translate(odoLine.start.x - 22, (odoLine.start.y + vPoint.y) / 2);
+                        ctx.rotate(-Math.PI / 2);
+                        drawTextWithOutline(Math.round(vDist) + 'mm', 0, 0, 14, '#ff0000');
+                        ctx.restore();
+                    }
+                }
+
                 drawLineWithOutline(odoLine.start.x, odoLine.start.y, odoLine.end.x, odoLine.end.y, COLORS.line, 3, 6);
 
                 // Label start point with coordinate (navy, bigger)
@@ -813,6 +855,28 @@
                 const endOdoY = toMM(odometryOrigin.y - odoLine.end.y);
                 drawTextWithOutline(`(${endOdoX.toFixed(0)}, ${endOdoY.toFixed(0)})`, odoLine.end.x, odoLine.end.y - 16, 14, '#000080');
             });
+
+            // Draw recorded points during recording mode
+            if (showOdometry && isRecording) {
+                recordedPoints.forEach(point => {
+                    const canvasX = odometryOrigin.x + toCanvas(point.odoX);
+                    const canvasY = odometryOrigin.y - toCanvas(point.odoY);
+
+                    // Draw point (white outer, navy inner)
+                    ctx.fillStyle = '#ffffff';
+                    ctx.beginPath();
+                    ctx.arc(canvasX, canvasY, 8, 0, Math.PI * 2);
+                    ctx.fill();
+
+                    ctx.fillStyle = '#000080';
+                    ctx.beginPath();
+                    ctx.arc(canvasX, canvasY, 5, 0, Math.PI * 2);
+                    ctx.fill();
+
+                    // Label coordinate
+                    drawTextWithOutline(`(${point.odoX.toFixed(1)}, ${point.odoY.toFixed(1)})`, canvasX, canvasY - 16, 12, '#000080');
+                });
+            }
 
             // Draw all saved lines
             lines.forEach(line => {
@@ -889,7 +953,7 @@
                 // Draw odometry coordinates if enabled and origin is set
                 if (showOdometry && odometryOrigin) {
                     const odoX = toMM(mousePos.x - odometryOrigin.x);
-                    const odoY = toMM(mousePos.y - odometryOrigin.y);
+                    const odoY = toMM(odometryOrigin.y - mousePos.y); // Flip Y so higher is positive
                     drawTextWithOutline(`X: ${odoX.toFixed(0)}mm`, mousePos.x, mousePos.y - 20, 12, '#4dd0e1');
                     drawTextWithOutline(`Y: ${odoY.toFixed(0)}mm`, mousePos.x, mousePos.y - 35, 12, '#4dd0e1');
                 }
@@ -1034,11 +1098,10 @@
             // Update odometry display in sidebar
             if (showOdometry && odometryOrigin) {
                 const odoX = toMM(mousePos.x - odometryOrigin.x);
-                const odoY = toMM(mousePos.y - odometryOrigin.y);
-                const odoAngle = Math.atan2(odoY, odoX) * 180 / Math.PI;
+                const odoY = toMM(odometryOrigin.y - mousePos.y); // Flip Y so higher is positive
                 document.getElementById('odo-x').textContent = odoX.toFixed(1) + ' mm';
                 document.getElementById('odo-y').textContent = odoY.toFixed(1) + ' mm';
-                document.getElementById('odo-angle').textContent = odoAngle.toFixed(1) + ' °';
+                document.getElementById('odo-angle').textContent = (Math.atan2(odoY, odoX) * 180 / Math.PI).toFixed(2) + ' °';
             }
 
             draw();
@@ -1058,6 +1121,15 @@
             if (showOdometry && !odometryOrigin) {
                 odometryOrigin = { x, y };
                 document.getElementById('odometry-info').style.display = 'block';
+                draw();
+                return;
+            }
+
+            // If recording mode, record point
+            if (showOdometry && isRecording) {
+                const odoX = toMM(x - odometryOrigin.x);
+                const odoY = toMM(odometryOrigin.y - y); // Flip Y so higher is positive
+                recordedPoints.push({ odoX, odoY });
                 draw();
                 return;
             }
@@ -1206,10 +1278,72 @@
         });
 
         // Wheel diameter handler
-        document.getElementById('wheel-diameter').addEventListener('change', (e) => {
+        document.getElementById('wheel-diameter').addEventListener('input', (e) => {
             wheelDiameter = parseFloat(e.target.value) || 62.4;
-            if (startPoint && !endPoint) {
+            // Update current measurement whenever wheel diameter changes and there's an active line
+            if (startPoint) {
                 updateMeasurements(startPoint, mousePos);
+                draw();
+            }
+        });
+
+        // Record button handler
+        document.getElementById('btn-record').addEventListener('click', () => {
+            isRecording = true;
+            recordedPoints = [];
+            // Clear points and lines but keep origin
+            odometryPoints = [];
+            odometryLines = [];
+            odometryAddMode = null;
+            startPoint = null;
+            endPoint = null;
+
+            // Disable other buttons
+            document.getElementById('btn-add-odometry-point').disabled = true;
+            document.getElementById('btn-add-odometry-line').disabled = true;
+            document.getElementById('btn-record').disabled = true;
+            document.getElementById('btn-stop').disabled = false;
+            document.getElementById('show-triangle').parentElement.style.opacity = '0.5';
+
+            // Hide output area
+            document.getElementById('record-output').style.display = 'none';
+
+            draw();
+        });
+
+        // Stop button handler
+        document.getElementById('btn-stop').addEventListener('click', () => {
+            isRecording = false;
+
+            // Re-enable other buttons
+            document.getElementById('btn-add-odometry-point').disabled = false;
+            document.getElementById('btn-add-odometry-line').disabled = false;
+            document.getElementById('btn-record').disabled = false;
+            document.getElementById('btn-stop').disabled = true;
+            document.getElementById('show-triangle').parentElement.style.opacity = '1';
+
+            // Generate Python list output
+            if (recordedPoints.length > 0) {
+                const pythonList = recordedPoints.map(p => `(${p.odoX.toFixed(1)}, ${p.odoY.toFixed(1)})`).join(', ');
+                const output = `[${pythonList}]`;
+                document.getElementById('python-output').value = output;
+                document.getElementById('record-output').style.display = 'block';
+            }
+
+            draw();
+        });
+
+        // Copy to clipboard handler
+        document.getElementById('btn-copy').addEventListener('click', () => {
+            const output = document.getElementById('python-output').value;
+            if (output) {
+                navigator.clipboard.writeText(output).then(() => {
+                    const copyBtn = document.getElementById('btn-copy');
+                    copyBtn.textContent = 'Copied!';
+                    setTimeout(() => {
+                        copyBtn.textContent = 'Copy to Clipboard';
+                    }, 2000);
+                });
             }
         });
     </script>
