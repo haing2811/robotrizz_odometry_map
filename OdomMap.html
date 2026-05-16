@@ -10,7 +10,7 @@
     <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700&display=swap" rel="stylesheet">
     <style>
         * {
-            margin: 0;
+            margin: 0;  
             padding: 0;
             box-sizing: border-box;
         }
@@ -656,9 +656,11 @@
 
         // Odometry state
         let odometryOrigin = null;
+        let odometryOriginAngle = 0; // Rotation angle of the Y-axis (0 = standard up)
         let odometryPoints = [];
         let odometryLines = [];
         let odometryAddMode = null; // 'point' or 'line'
+        let isAngleIndicatorActive = false; // True after origin placed, before angle set
 
         // Route state
         let routeOrigin = null;
@@ -671,6 +673,121 @@
         // Recording state
         let isRecording = false;
         let recordedPoints = [];
+
+        // Start box positions per year/category (field coordinates in mm)
+        // Each entry: [x_center, y_center] in mm
+        const START_BOX_POSITIONS = {
+            '2026': {
+                'Elementary': [500, 571.5],  // Example positions - adjust based on actual field
+                'Junior': [500, 571.5],
+                'Senior': [500, 571.5],
+                'RoboSports': [500, 571.5]
+            },
+            '2025': {
+                'Elementary': [400, 571.5],
+                'Junior': [400, 571.5],
+                'Senior': [400, 571.5],
+                'RoboSports': [400, 571.5]
+            },
+            '2024': {
+                'Elementary': [350, 571.5],
+                'Junior': [350, 571.5],
+                'Senior': [350, 571.5],
+                'RoboSports': [350, 571.5]
+            },
+            '2023': {
+                'Elementary': [400, 571.5],
+                'Junior': [400, 571.5],
+                'Senior': [400, 571.5],
+                'RoboSports': [400, 571.5]
+            }
+        };
+
+        // Get snapped origin position (nearest start box center)
+        function getSnappedOrigin(x, y) {
+            const year = document.getElementById('year-select').value;
+            const category = document.getElementById('category-select').value;
+            const boxPos = START_BOX_POSITIONS[year]?.[category] || [500, 571.5];
+            const snapDistance = 150; // Snap within 150px
+
+            const boxCanvasX = toCanvas(boxPos[0]);
+            const boxCanvasY = toCanvas(boxPos[1]);
+
+            const dx = x - boxCanvasX;
+            const dy = y - boxCanvasY;
+            const dist = Math.sqrt(dx * dx + dy * dy);
+
+            if (dist < snapDistance) {
+                return { x: boxCanvasX, y: boxCanvasY, snapped: true };
+            }
+            return { x, y, snapped: false };
+        }
+
+        // Check if point is near axis (within snap threshold) - works with rotated axes
+        function isNearAxis(canvasX, canvasY, originX, originY, threshold = 30) {
+            const dx = canvasX - originX;
+            const dy = canvasY - originY;
+            const angleRad = odometryOriginAngle * Math.PI / 180;
+
+            // Project point onto the rotated Y-axis direction
+            const projY = (dx * Math.cos(angleRad) + dy * Math.sin(angleRad));
+            // Distance from rotated Y-axis = perpendicular component
+            const distToYAxis = Math.abs(-dx * Math.sin(angleRad) + dy * Math.cos(angleRad));
+
+            // Project point onto the rotated X-axis direction (perpendicular to Y)
+            const projX = (dx * Math.cos(angleRad + Math.PI/2) + dy * Math.sin(angleRad + Math.PI/2));
+            // Distance from rotated X-axis
+            const distToXAxis = Math.abs(dx * Math.sin(angleRad + Math.PI/2) - dy * Math.cos(angleRad + Math.PI/2));
+
+            // Check if near Y-axis (distance to Y-axis line is small, and projection is not too far)
+            if (distToYAxis < threshold && projY > -threshold) {
+                return { type: 'rotatedY', value: projY };
+            }
+            // Check if near X-axis
+            if (distToXAxis < threshold && projX > -threshold) {
+                return { type: 'rotatedX', value: projX };
+            }
+            return null;
+        }
+
+        // Snap point to nearest rotated axis or origin
+        function snapToAxis(canvasX, canvasY, originX, originY, threshold = 30) {
+            const dx = canvasX - originX;
+            const dy = canvasY - originY;
+            const angleRad = odometryOriginAngle * Math.PI / 180;
+
+            // Project onto rotated axes
+            const projY = dx * Math.cos(angleRad) + dy * Math.sin(angleRad);
+            const projX = dx * Math.cos(angleRad + Math.PI/2) + dy * Math.sin(angleRad + Math.PI/2);
+
+            // Distance to each axis line
+            const distToYAxis = Math.abs(-dx * Math.sin(angleRad) + dy * Math.cos(angleRad));
+            const distToXAxis = Math.abs(dx * Math.sin(angleRad + Math.PI/2) - dy * Math.cos(angleRad + Math.PI/2));
+
+            // Check if near origin first
+            const distToOrigin = Math.sqrt(dx * dx + dy * dy);
+            if (distToOrigin < threshold) {
+                return { x: originX, y: originY };
+            }
+
+            // Snap to Y-axis (project Y, keep X component on the line)
+            if (distToYAxis < threshold) {
+                return {
+                    x: originX + projY * Math.cos(angleRad),
+                    y: originY + projY * Math.sin(angleRad)
+                };
+            }
+
+            // Snap to X-axis
+            if (distToXAxis < threshold) {
+                return {
+                    x: originX + projX * Math.cos(angleRad + Math.PI/2),
+                    y: originY + projX * Math.sin(angleRad + Math.PI/2)
+                };
+            }
+
+            return { x: canvasX, y: canvasY };
+        }
 
         // Colors
         const COLORS = {
@@ -776,6 +893,228 @@
             // Red fill
             ctx.fillStyle = color || COLORS.text;
             ctx.fillText(text, x, y);
+        }
+
+        // Draw angle indicator bar (rotating bar to set angle) - follows mouse
+        function drawAngleIndicatorBar() {
+            if (!isMouseOver) return;
+
+            const barLength = 80;
+            const arrowSize = 12;
+
+            // Calculate angle from origin to mouse position
+            // 0° = up, 90° = right, 180° = down, -90° = left
+            const dx = mousePos.x - odometryOrigin.x;
+            const dy = mousePos.y - odometryOrigin.y;
+            let angleDeg = Math.atan2(dx, -dy) * 180 / Math.PI;
+
+            // Constrain to -180 to 180 range
+            if (angleDeg > 180) angleDeg -= 360;
+            if (angleDeg < -180) angleDeg += 360;
+
+            // Snap to major angles while dragging
+            const snapThreshold = 10;
+            const majorAngles = [0, 90, 180, -90];
+            for (const targetAngle of majorAngles) {
+                let diff = angleDeg - targetAngle;
+                while (diff > 180) diff -= 360;
+                while (diff < -180) diff += 360;
+                if (Math.abs(diff) < snapThreshold) {
+                    angleDeg = targetAngle;
+                    break;
+                }
+            }
+
+            const angleRad = angleDeg * Math.PI / 180;
+
+            // Draw the rotating bar from origin toward mouse position
+            // For 0°=up, use sin for x component and -cos for y component
+            const endX = odometryOrigin.x + barLength * Math.sin(angleRad);
+            const endY = odometryOrigin.y - barLength * Math.cos(angleRad);
+
+            // Draw bar with white outline
+            drawLineWithOutline(odometryOrigin.x, odometryOrigin.y, endX, endY, '#000080', 4, 7);
+
+            // Draw arrow head at the end (pointing in direction of angle)
+            const arrowAngle1 = Math.atan2(-Math.cos(angleRad), Math.sin(angleRad)) + Math.PI * 0.8;
+            const arrowAngle2 = Math.atan2(-Math.cos(angleRad), Math.sin(angleRad)) - Math.PI * 0.8;
+
+            ctx.fillStyle = '#ffffff';
+            ctx.beginPath();
+            ctx.moveTo(endX, endY);
+            ctx.lineTo(endX + arrowSize * Math.cos(arrowAngle1), endY + arrowSize * Math.sin(arrowAngle1));
+            ctx.lineTo(endX + arrowSize * Math.cos(arrowAngle2), endY + arrowSize * Math.sin(arrowAngle2));
+            ctx.closePath();
+            ctx.fill();
+
+            ctx.fillStyle = '#000080';
+            ctx.beginPath();
+            ctx.moveTo(endX, endY);
+            ctx.lineTo(endX + (arrowSize - 3) * Math.cos(arrowAngle1), endY + (arrowSize - 3) * Math.sin(arrowAngle1));
+            ctx.lineTo(endX + (arrowSize - 3) * Math.cos(arrowAngle2), endY + (arrowSize - 3) * Math.sin(arrowAngle2));
+            ctx.closePath();
+            ctx.fill();
+        }
+
+        // Draw the rotated Y-axis based on current angle
+        function drawRotatedYAxis() {
+            const angleRad = odometryOriginAngle * Math.PI / 180;
+
+            // Y-axis points in direction of angle (0°=up, 90°=right, 180°=down, -90°=left)
+            // Using: yDirX = sin(angle), yDirY = -cos(angle)
+            // When angle=0: yDirX=0, yDirY=-1 (UP)
+            const yDirX = Math.sin(angleRad);
+            const yDirY = -Math.cos(angleRad);
+
+            // Find intersection with canvas edges for Y-axis (both directions)
+            const yIntersects = getAxisIntersections(odometryOrigin.x, odometryOrigin.y, yDirX, yDirY);
+            const yEnd1 = yIntersects[0];
+            const yEnd2 = yIntersects[1];
+
+            // Draw Y-axis (0° to 180° line)
+            ctx.strokeStyle = '#4dd0e1';
+            ctx.lineWidth = 2;
+            ctx.setLineDash([6, 4]);
+            ctx.beginPath();
+            ctx.moveTo(yEnd1.x, yEnd1.y);
+            ctx.lineTo(yEnd2.x, yEnd2.y);
+            ctx.stroke();
+            ctx.setLineDash([]);
+
+            // Y-axis arrowhead at 0° direction
+            const arrowX = odometryOrigin.x + 40 * yDirX;
+            const arrowY = odometryOrigin.y + 40 * yDirY;
+            const arrowAngle1 = Math.atan2(yDirY, yDirX) + Math.PI * 0.85;
+            const arrowAngle2 = Math.atan2(yDirY, yDirX) - Math.PI * 0.85;
+
+            ctx.fillStyle = '#ffffff';
+            ctx.beginPath();
+            ctx.moveTo(arrowX, arrowY);
+            ctx.lineTo(arrowX + 14 * Math.cos(arrowAngle1), arrowY + 14 * Math.sin(arrowAngle1));
+            ctx.lineTo(arrowX + 14 * Math.cos(arrowAngle2), arrowY + 14 * Math.sin(arrowAngle2));
+            ctx.closePath();
+            ctx.fill();
+
+            ctx.fillStyle = '#4dd0e1';
+            ctx.beginPath();
+            ctx.moveTo(arrowX, arrowY);
+            ctx.lineTo(arrowX + 10 * Math.cos(arrowAngle1), arrowY + 10 * Math.sin(arrowAngle1));
+            ctx.lineTo(arrowX + 10 * Math.cos(arrowAngle2), arrowY + 10 * Math.sin(arrowAngle2));
+            ctx.closePath();
+            ctx.fill();
+
+            // X-axis is 90° from Y-axis (perpendicular)
+            // When angle=0: X points right (90°)
+            const xDirX = Math.cos(angleRad);
+            const xDirY = Math.sin(angleRad);
+
+            // Find intersection with canvas edges for X-axis
+            const xIntersects = getAxisIntersections(odometryOrigin.x, odometryOrigin.y, xDirX, xDirY);
+            const xEnd1 = xIntersects[0];
+            const xEnd2 = xIntersects[1];
+
+            // Draw X-axis (90° to -90° line)
+            ctx.strokeStyle = '#4dd0e1';
+            ctx.lineWidth = 2;
+            ctx.setLineDash([6, 4]);
+            ctx.beginPath();
+            ctx.moveTo(xEnd1.x, xEnd1.y);
+            ctx.lineTo(xEnd2.x, xEnd2.y);
+            ctx.stroke();
+            ctx.setLineDash([]);
+
+            // X-axis arrowhead at 90° direction
+            const xArrowX = odometryOrigin.x + 40 * xDirX;
+            const xArrowY = odometryOrigin.y + 40 * xDirY;
+            const xArrowAngle1 = Math.atan2(xDirY, xDirX) + Math.PI * 0.85;
+            const xArrowAngle2 = Math.atan2(xDirY, xDirX) - Math.PI * 0.85;
+
+            ctx.fillStyle = '#ffffff';
+            ctx.beginPath();
+            ctx.moveTo(xArrowX, xArrowY);
+            ctx.lineTo(xArrowX + 12 * Math.cos(xArrowAngle1), xArrowY + 12 * Math.sin(xArrowAngle1));
+            ctx.lineTo(xArrowX + 12 * Math.cos(xArrowAngle2), xArrowY + 12 * Math.sin(xArrowAngle2));
+            ctx.closePath();
+            ctx.fill();
+
+            ctx.fillStyle = '#4dd0e1';
+            ctx.beginPath();
+            ctx.moveTo(xArrowX, xArrowY);
+            ctx.lineTo(xArrowX + 9 * Math.cos(xArrowAngle1), xArrowY + 9 * Math.sin(xArrowAngle1));
+            ctx.lineTo(xArrowX + 9 * Math.cos(xArrowAngle2), xArrowY + 9 * Math.sin(xArrowAngle2));
+            ctx.closePath();
+            ctx.fill();
+
+            // Label axes with degree values
+            // Y-axis: 0° at positive end, 180° at negative end
+            drawTextWithOutline('0°', odometryOrigin.x + 50 * yDirX, odometryOrigin.y + 50 * yDirY, 14, '#4dd0e1');
+            drawTextWithOutline('180°', odometryOrigin.x - 60 * yDirX, odometryOrigin.y - 60 * yDirY, 14, '#4dd0e1');
+            // X-axis: 90° at positive end, -90° at negative end
+            drawTextWithOutline('90°', odometryOrigin.x + 50 * xDirX, odometryOrigin.y + 50 * xDirY, 14, '#4dd0e1');
+            drawTextWithOutline('-90°', odometryOrigin.x - 60 * xDirX, odometryOrigin.y - 60 * xDirY, 14, '#4dd0e1');
+        }
+
+        // Calculate where an axis line from origin intersects canvas edges
+        function getAxisIntersections(originX, originY, dirX, dirY) {
+            const intersections = [];
+            const margin = 20;
+
+            // Check intersection with all four canvas edges
+            // Top edge (y = margin)
+            if (dirY !== 0) {
+                const t1 = (margin - originY) / dirY;
+                const ix = originX + t1 * dirX;
+                if (ix >= -margin && ix <= canvasWidth + margin) {
+                    intersections.push({ x: ix, y: margin });
+                }
+            }
+            // Bottom edge (y = canvasHeight - margin)
+            if (dirY !== 0) {
+                const t2 = (canvasHeight - margin - originY) / dirY;
+                const ix = originX + t2 * dirX;
+                if (ix >= -margin && ix <= canvasWidth + margin) {
+                    intersections.push({ x: ix, y: canvasHeight - margin });
+                }
+            }
+            // Left edge (x = margin)
+            if (dirX !== 0) {
+                const t3 = (margin - originX) / dirX;
+                const iy = originY + t3 * dirY;
+                if (iy >= -margin && iy <= canvasHeight + margin) {
+                    intersections.push({ x: margin, y: iy });
+                }
+            }
+            // Right edge (x = canvasWidth - margin)
+            if (dirX !== 0) {
+                const t4 = (canvasWidth - margin - originX) / dirX;
+                const iy = originY + t4 * dirY;
+                if (iy >= -margin && iy <= canvasHeight + margin) {
+                    intersections.push({ x: canvasWidth - margin, y: iy });
+                }
+            }
+
+            // If we got 2 intersections, we're good. Otherwise add points along the direction
+            if (intersections.length < 2) {
+                intersections.push({ x: originX + dirX * 400, y: originY + dirY * 400 });
+                intersections.push({ x: originX - dirX * 400, y: originY - dirY * 400 });
+            }
+
+            return intersections;
+        }
+
+        // Calculate odometry coordinates based on rotated axes
+        // 0° = up (Y+), 90° = right (X+), 180° = down (Y-), -90° = left (X-)
+        function calculateRotatedCoordinates(canvasX, canvasY) {
+            const dx = canvasX - odometryOrigin.x;
+            const dy = canvasY - odometryOrigin.y;
+            const angleRad = odometryOriginAngle * Math.PI / 180;
+
+            // X-axis points at angle: (cos(angle), sin(angle))
+            // Y-axis points at angle-90° from X, which is (sin(angle), -cos(angle))
+            const odoX = (dx * Math.cos(angleRad) + dy * Math.sin(angleRad)) / scale;
+            const odoY = (dx * Math.sin(angleRad) - dy * Math.cos(angleRad)) / scale;
+
+            return { odoX, odoY };
         }
 
         function drawLineWithInfo(lineData, isActive = false) {
@@ -912,19 +1251,13 @@
                 // Label "(0, 0)" below (white outline, black text)
                 drawTextWithOutline('(0, 0)', odometryOrigin.x, odometryOrigin.y + 28, 12, '#000000');
 
-                // Draw crosshair lines from origin
-                ctx.strokeStyle = '#4dd0e1';
-                ctx.lineWidth = 1;
-                ctx.setLineDash([4, 4]);
-                ctx.beginPath();
-                ctx.moveTo(odometryOrigin.x, 0);
-                ctx.lineTo(odometryOrigin.x, canvasHeight);
-                ctx.stroke();
-                ctx.beginPath();
-                ctx.moveTo(0, odometryOrigin.y);
-                ctx.lineTo(canvasWidth, odometryOrigin.y);
-                ctx.stroke();
-                ctx.setLineDash([]);
+                // Draw angle indicator bar if active (waiting for angle to be set)
+                if (isAngleIndicatorActive) {
+                    drawAngleIndicatorBar();
+                } else if (odometryOrigin) {
+                    // Always draw the rotated Y-axis arrow when origin is set
+                    drawRotatedYAxis();
+                }
             }
 
             // Draw "place origin" prompt when origin not yet placed in odometry mode
@@ -940,6 +1273,7 @@
                 ctx.fillText('place origin', mousePos.x, mousePos.y - 30);
             }
 
+            
             // Draw "place origin" prompt when origin not yet placed in route mode
             if (currentMode === 'route' && !routeOrigin && isMouseOver) {
                 ctx.font = 'bold 18px Orbitron, Courier New, monospace';
@@ -965,8 +1299,9 @@
                 ctx.arc(point.x, point.y, 5, 0, Math.PI * 2);
                 ctx.fill();
 
-                // Label with coordinate (white outline, navy text, larger)
-                drawTextWithOutline(`(${point.odoX.toFixed(0)}, ${point.odoY.toFixed(0)})`, point.x, point.y - 16, 14, '#000080');
+                // Label with rotated coordinate
+                const coords = calculateRotatedCoordinates(point.x, point.y);
+                drawTextWithOutline(`(${coords.odoX.toFixed(0)}, ${coords.odoY.toFixed(0)})`, point.x, point.y - 16, 14, '#000080');
             });
 
             // Draw odometry lines (thinner, red like hover)
@@ -1002,36 +1337,31 @@
 
                 drawLineWithOutline(odoLine.start.x, odoLine.start.y, odoLine.end.x, odoLine.end.y, COLORS.line, 3, 6);
 
-                // Label start point with coordinate (navy, bigger)
-                const startOdoX = toMM(odoLine.start.x - odometryOrigin.x);
-                const startOdoY = toMM(odometryOrigin.y - odoLine.start.y);
-                drawTextWithOutline(`(${startOdoX.toFixed(0)}, ${startOdoY.toFixed(0)})`, odoLine.start.x, odoLine.start.y - 16, 14, '#000080');
+                // Label start point with rotated coordinate
+                const startCoords = calculateRotatedCoordinates(odoLine.start.x, odoLine.start.y);
+                drawTextWithOutline(`(${startCoords.odoX.toFixed(0)}, ${startCoords.odoY.toFixed(0)})`, odoLine.start.x, odoLine.start.y - 16, 14, '#000080');
 
-                // Label end point with coordinate (navy, bigger)
-                const endOdoX = toMM(odoLine.end.x - odometryOrigin.x);
-                const endOdoY = toMM(odometryOrigin.y - odoLine.end.y);
-                drawTextWithOutline(`(${endOdoX.toFixed(0)}, ${endOdoY.toFixed(0)})`, odoLine.end.x, odoLine.end.y - 16, 14, '#000080');
+                // Label end point with rotated coordinate
+                const endCoords = calculateRotatedCoordinates(odoLine.end.x, odoLine.end.y);
+                drawTextWithOutline(`(${endCoords.odoX.toFixed(0)}, ${endCoords.odoY.toFixed(0)})`, odoLine.end.x, odoLine.end.y - 16, 14, '#000080');
             });
 
-            // Draw recorded points during recording mode
-            if (currentMode === 'odometry' && isRecording) {
+            // Draw recorded points during recording mode (and after stop)
+            if (currentMode === 'odometry' && recordedPoints.length > 0) {
                 recordedPoints.forEach(point => {
-                    const canvasX = odometryOrigin.x + toCanvas(point.odoX);
-                    const canvasY = odometryOrigin.y - toCanvas(point.odoY);
-
                     // Draw point (white outer, navy inner)
                     ctx.fillStyle = '#ffffff';
                     ctx.beginPath();
-                    ctx.arc(canvasX, canvasY, 8, 0, Math.PI * 2);
+                    ctx.arc(point.x, point.y, 7, 0, Math.PI * 2);
                     ctx.fill();
 
                     ctx.fillStyle = '#000080';
                     ctx.beginPath();
-                    ctx.arc(canvasX, canvasY, 5, 0, Math.PI * 2);
+                    ctx.arc(point.x, point.y, 5, 0, Math.PI * 2);
                     ctx.fill();
 
-                    // Label coordinate
-                    drawTextWithOutline(`(${point.odoX.toFixed(1)}, ${point.odoY.toFixed(1)})`, canvasX, canvasY - 16, 12, '#000080');
+                    // Label with rotated coordinate
+                    drawTextWithOutline(`(${point.odoX.toFixed(1)}, ${point.odoY.toFixed(1)})`, point.x, point.y - 16, 14, '#000080');
                 });
             }
 
@@ -1042,10 +1372,30 @@
 
             // Draw current line being created
             if (startPoint && isMouseOver) {
-                const dx = mousePos.x - startPoint.x;
-                const dy = mousePos.y - startPoint.y;
-                const dist = calculateDistance(startPoint, mousePos);
-                let angle = Math.abs(calculateAngle(startPoint, mousePos));
+                // Apply snapping to both start and end points in odometry mode
+                let snappedStart = startPoint;
+                let snappedPreview = mousePos;
+                let isStartSnapped = false;
+                let isEndSnapped = false;
+
+                if (currentMode === 'odometry' && odometryOrigin && !isAngleIndicatorActive) {
+                    // Snap the start point for preview
+                    snappedStart = snapToAxis(startPoint.x, startPoint.y, odometryOrigin.x, odometryOrigin.y);
+                    if (snappedStart.x !== startPoint.x || snappedStart.y !== startPoint.y) {
+                        isStartSnapped = true;
+                    }
+
+                    // Snap the preview/end point
+                    snappedPreview = snapToAxis(mousePos.x, mousePos.y, odometryOrigin.x, odometryOrigin.y);
+                    if (snappedPreview.x !== mousePos.x || snappedPreview.y !== mousePos.y) {
+                        isEndSnapped = true;
+                    }
+                }
+
+                const dx = snappedPreview.x - snappedStart.x;
+                const dy = snappedPreview.y - snappedStart.y;
+                const dist = calculateDistance(snappedStart, snappedPreview);
+                let angle = Math.abs(calculateAngle(snappedStart, snappedPreview));
                 // Always show reference angle (smallest angle, < 90)
                 if (angle > 90) {
                     angle = 180 - angle;
@@ -1055,21 +1405,21 @@
 
                 // Draw triangle preview
                 if (showTriangle) {
-                    const hPoint = { x: mousePos.x, y: startPoint.y };
-                    const vPoint = { x: startPoint.x, y: mousePos.y };
+                    const hPoint = { x: snappedPreview.x, y: snappedStart.y };
+                    const vPoint = { x: snappedStart.x, y: snappedPreview.y };
 
                     // Triangle legs with outline
-                    drawLineWithOutline(startPoint.x, startPoint.y, hPoint.x, hPoint.y, COLORS.triangleLegs, 4, 7);
-                    drawLineWithOutline(startPoint.x, startPoint.y, vPoint.x, vPoint.y, COLORS.triangleLegs, 4, 7);
+                    drawLineWithOutline(snappedStart.x, snappedStart.y, hPoint.x, hPoint.y, COLORS.triangleLegs, 4, 7);
+                    drawLineWithOutline(snappedStart.x, snappedStart.y, vPoint.x, vPoint.y, COLORS.triangleLegs, 4, 7);
 
                     // Leg distances
                     if (showLegs) {
                         // Leg distances with red text and white outline
                         const hDist = Math.abs(toMM(dx));
-                        drawTextWithOutline(Math.round(hDist) + 'mm', (startPoint.x + hPoint.x) / 2, startPoint.y - 12, 14, '#ff0000');
+                        drawTextWithOutline(Math.round(hDist) + 'mm', (snappedStart.x + hPoint.x) / 2, snappedStart.y - 12, 14, '#ff0000');
 
                         ctx.save();
-                        ctx.translate(startPoint.x - 22, (startPoint.y + vPoint.y) / 2);
+                        ctx.translate(snappedStart.x - 22, (snappedStart.y + vPoint.y) / 2);
                         ctx.rotate(-Math.PI / 2);
                         const vDist = Math.abs(toMM(dy));
                         drawTextWithOutline(Math.round(vDist) + 'mm', 0, 0, 14, '#ff0000');
@@ -1079,28 +1429,39 @@
 
                 // Draw angle arc preview
                 if (showAngle) {
-                    drawAngleText(startPoint, mousePos);
+                    drawAngleText(snappedStart, snappedPreview);
                 }
 
-                // Draw preview line with white outline
-                drawLineWithOutline(startPoint.x, startPoint.y, mousePos.x, mousePos.y, COLORS.line, 5, 9);
+                // Draw preview line with white outline (navy color when snapped)
+                const lineColor = (isStartSnapped || isEndSnapped) ? '#000080' : COLORS.line;
+                drawLineWithOutline(snappedStart.x, snappedStart.y, snappedPreview.x, snappedPreview.y, lineColor, 5, 9);
+
+                // Draw snapped indicator circle
+                if (isEndSnapped) {
+                    ctx.strokeStyle = '#000080';
+                    ctx.lineWidth = 2;
+                    ctx.beginPath();
+                    ctx.arc(snappedPreview.x, snappedPreview.y, 15, 0, Math.PI * 2);
+                    ctx.stroke();
+                }
 
                 // Preview distance (red with white outline)
                 if (showDistance) {
-                    const midX = (startPoint.x + mousePos.x) / 2;
-                    const midY = (startPoint.y + mousePos.y) / 2;
+                    const midX = (snappedStart.x + snappedPreview.x) / 2;
+                    const midY = (snappedStart.y + snappedPreview.y) / 2;
                     drawTextWithOutline(dist.toFixed(0) + 'mm', midX, midY - 20, 15, '#ff0000');
                 }
 
                 // Preview wheel degrees (red with white outline)
                 if (showWheelDeg) {
-                    const midX = (startPoint.x + mousePos.x) / 2;
-                    const midY = (startPoint.y + mousePos.y) / 2;
+                    const midX = (snappedStart.x + snappedPreview.x) / 2;
+                    const midY = (snappedStart.y + snappedPreview.y) / 2;
                     drawTextWithOutline(wheelDeg.toFixed(1) + '°', midX, midY + 24, 14, '#ff0000');
                 }
 
-                // Draw start point
-                drawPoint(startPoint, COLORS.startPoint, 7, 5);
+                // Draw start point (show snapped position if snapped)
+                const drawStart = isStartSnapped ? snappedStart : startPoint;
+                drawPoint(drawStart, COLORS.startPoint, 7, 5);
             }
 
             // Draw saved edge lines
@@ -1154,11 +1515,10 @@
                 drawRobotCursor(mousePos.x, mousePos.y);
 
                 // Draw odometry coordinates if enabled and origin is set
-                if (currentMode === 'odometry' && odometryOrigin) {
-                    const odoX = toMM(mousePos.x - odometryOrigin.x);
-                    const odoY = toMM(odometryOrigin.y - mousePos.y); // Flip Y so higher is positive
-                    drawTextWithOutline(`X: ${odoX.toFixed(0)}mm`, mousePos.x, mousePos.y - 20, 12, '#4dd0e1');
-                    drawTextWithOutline(`Y: ${odoY.toFixed(0)}mm`, mousePos.x, mousePos.y - 35, 12, '#4dd0e1');
+                if (currentMode === 'odometry' && odometryOrigin && !isAngleIndicatorActive) {
+                    const coords = calculateRotatedCoordinates(mousePos.x, mousePos.y);
+                    drawTextWithOutline(`X: ${coords.odoX.toFixed(0)}mm`, mousePos.x, mousePos.y - 20, 12, '#4dd0e1');
+                    drawTextWithOutline(`Y: ${coords.odoY.toFixed(0)}mm`, mousePos.x, mousePos.y - 35, 12, '#4dd0e1');
                 }
             }
 
@@ -1434,11 +1794,23 @@
 
             // Update odometry display in sidebar
             if (currentMode === 'odometry' && odometryOrigin) {
-                const odoX = toMM(mousePos.x - odometryOrigin.x);
-                const odoY = toMM(odometryOrigin.y - mousePos.y); // Flip Y so higher is positive
-                document.getElementById('odo-x').textContent = odoX.toFixed(1) + ' mm';
-                document.getElementById('odo-y').textContent = odoY.toFixed(1) + ' mm';
-                document.getElementById('odo-angle').textContent = (Math.atan2(odoY, odoX) * 180 / Math.PI).toFixed(2) + ' °';
+                if (isAngleIndicatorActive) {
+                    // Show the angle that will be set on click
+                    const dx = mousePos.x - odometryOrigin.x;
+                    const dy = mousePos.y - odometryOrigin.y;
+                    let angleDeg = Math.atan2(dy, dx) * 180 / Math.PI;
+                    if (angleDeg > 180) angleDeg -= 360;
+                    if (angleDeg < -180) angleDeg += 360;
+                    document.getElementById('odo-x').textContent = '-- mm';
+                    document.getElementById('odo-y').textContent = '-- mm';
+                    document.getElementById('odo-angle').textContent = angleDeg.toFixed(1) + ' °';
+                } else {
+                    // Use rotated coordinates
+                    const coords = calculateRotatedCoordinates(mousePos.x, mousePos.y);
+                    document.getElementById('odo-x').textContent = coords.odoX.toFixed(1) + ' mm';
+                    document.getElementById('odo-y').textContent = coords.odoY.toFixed(1) + ' mm';
+                    document.getElementById('odo-angle').textContent = odometryOriginAngle.toFixed(1) + ' °';
+                }
             }
 
             draw();
@@ -1474,45 +1846,80 @@
 
             // If odometry mode is on and origin not set, set the origin
             if (currentMode === 'odometry' && !odometryOrigin) {
-                odometryOrigin = { x, y };
+                const snapped = getSnappedOrigin(x, y);
+                odometryOrigin = { x: snapped.x, y: snapped.y, snapped: snapped.snapped };
+                isAngleIndicatorActive = true;
+                odometryOriginAngle = 0; // Start at 0 (standard up)
                 document.getElementById('odometry-info').style.display = 'block';
                 draw();
                 return;
             }
 
-            // If recording mode, record point
+            // If angle indicator is active, set the angle on click
+            if (currentMode === 'odometry' && isAngleIndicatorActive) {
+                // Calculate angle from origin to click position
+                // 0° = up (Y negative), 90° = right (X positive), 180° = down, -90° = left
+                const dx = x - odometryOrigin.x;
+                const dy = y - odometryOrigin.y;
+                let angleDeg = Math.atan2(dx, -dy) * 180 / Math.PI;
+
+                // Constrain to -180 to 180 range
+                if (angleDeg > 180) angleDeg -= 360;
+                if (angleDeg < -180) angleDeg += 360;
+
+                // Snap to major angles: 0, 90, 180, -90
+                const snapThreshold = 10;
+                const majorAngles = [0, 90, 180, -90];
+                for (const targetAngle of majorAngles) {
+                    let diff = angleDeg - targetAngle;
+                    // Normalize difference to -180 to 180
+                    while (diff > 180) diff -= 360;
+                    while (diff < -180) diff += 360;
+                    if (Math.abs(diff) < snapThreshold) {
+                        angleDeg = targetAngle;
+                        break;
+                    }
+                }
+
+                odometryOriginAngle = angleDeg;
+                isAngleIndicatorActive = false;
+                draw();
+                return;
+            }
+
+            // If recording mode, record point (with snapping and rotated coordinates)
             if (currentMode === 'odometry' && isRecording) {
-                const odoX = toMM(x - odometryOrigin.x);
-                const odoY = toMM(odometryOrigin.y - y); // Flip Y so higher is positive
-                recordedPoints.push({ odoX, odoY });
+                const snapped = snapToAxis(x, y, odometryOrigin.x, odometryOrigin.y);
+                const coords = calculateRotatedCoordinates(snapped.x, snapped.y);
+                recordedPoints.push({ x: snapped.x, y: snapped.y, odoX: coords.odoX, odoY: coords.odoY });
                 draw();
                 return;
             }
 
-            // If adding odometry point
+            // If adding odometry point (with snapping and rotated coordinates)
             if (currentMode === 'odometry' && odometryAddMode === 'point') {
-                const odoX = toMM(x - odometryOrigin.x);
-                const odoY = toMM(odometryOrigin.y - y); // Flip Y so higher is positive
-                odometryPoints.push({ x, y, odoX, odoY });
+                const snapped = snapToAxis(x, y, odometryOrigin.x, odometryOrigin.y);
+                const coords = calculateRotatedCoordinates(snapped.x, snapped.y);
+                odometryPoints.push({ x: snapped.x, y: snapped.y, odoX: coords.odoX, odoY: coords.odoY });
                 draw();
                 return;
             }
 
-            // If adding odometry line
+            // If adding odometry line (with snapping and rotated coordinates)
             if (currentMode === 'odometry' && odometryAddMode === 'line') {
                 if (!startPoint) {
-                    startPoint = { x, y };
+                    const snapped = snapToAxis(x, y, odometryOrigin.x, odometryOrigin.y);
+                    startPoint = { x: snapped.x, y: snapped.y };
                 } else {
-                    endPoint = { x, y };
-                    const dx = toMM(endPoint.x - startPoint.x);
-                    const dy = toMM(startPoint.y - endPoint.y); // Flip Y
-                    const dist = Math.sqrt(dx * dx + dy * dy);
-                    const angle = Math.atan2(-dy, dx) * 180 / Math.PI;
+                    const snapped = snapToAxis(x, y, odometryOrigin.x, odometryOrigin.y);
+                    endPoint = { x: snapped.x, y: snapped.y };
+                    const coords = calculateRotatedCoordinates(snapped.x, snapped.y);
+                    const dist = Math.sqrt(Math.pow(toMM(endPoint.x - startPoint.x), 2) + Math.pow(toMM(endPoint.y - startPoint.y), 2));
                     odometryLines.push({
                         start: { ...startPoint },
                         end: { ...endPoint },
                         dist: dist,
-                        angle: angle
+                        angle: odometryOriginAngle
                     });
                     startPoint = null;
                     endPoint = null;
@@ -1555,10 +1962,20 @@
             }
 
             if (!startPoint) {
-                startPoint = { x, y };
+                let startPos = { x, y };
+                // Apply snapping to axes if in odometry mode with origin set
+                if (currentMode === 'odometry' && odometryOrigin && !isAngleIndicatorActive) {
+                    startPos = snapToAxis(x, y, odometryOrigin.x, odometryOrigin.y);
+                }
+                startPoint = startPos;
                 endPoint = null;
             } else if (!endPoint) {
-                endPoint = { x, y };
+                let endPos = { x, y };
+                // Apply snapping to axes if in odometry mode with origin set
+                if (currentMode === 'odometry' && odometryOrigin && !isAngleIndicatorActive) {
+                    endPos = snapToAxis(x, y, odometryOrigin.x, odometryOrigin.y);
+                }
+                endPoint = endPos;
                 lines.push({
                     start: { ...startPoint },
                     end: { ...endPoint }
@@ -1654,10 +2071,15 @@
             edgeLines = [];
             startPoint = null;
             endPoint = null;
-            // In odometry mode, clear points and lines but keep origin
+            // In odometry mode, clear points and lines but keep origin and angle
             if (currentMode === 'odometry') {
                 odometryPoints = [];
                 odometryLines = [];
+                recordedPoints = [];
+                isRecording = false;
+                document.getElementById('btn-record').disabled = false;
+                document.getElementById('btn-stop').disabled = true;
+                document.getElementById('record-output').style.display = 'none';
             }
             // In route mode, clear all route data
             if (currentMode === 'route') {
@@ -1676,6 +2098,8 @@
             if (e.target.checked) {
                 currentMode = 'normal';
                 odometryOrigin = null;
+                odometryOriginAngle = 0;
+                isAngleIndicatorActive = false;
                 odometryPoints = [];
                 odometryLines = [];
                 odometryAddMode = null;
@@ -1685,6 +2109,7 @@
                 routeIsPlanning = false;
                 routePendingLine = null;
                 unloadRoute();
+                recordedPoints = [];
                 document.getElementById('odometry-info').style.display = 'none';
                 document.getElementById('route-info').style.display = 'none';
                 document.getElementById('route-loaded-info').style.display = 'none';
@@ -1707,10 +2132,17 @@
                 routeLines = [];
                 routeIsPlanning = false;
                 routePendingLine = null;
+                odometryOrigin = null;
+                odometryOriginAngle = 0;
+                odometryPoints = [];
+                odometryLines = [];
+                recordedPoints = [];
+                odometryAddMode = null;
+                isRecording = false;
+                isAngleIndicatorActive = false;
                 document.getElementById('route-info').style.display = 'none';
                 document.getElementById('saved-routes-section').style.display = 'none';
                 document.getElementById('odometry-info').style.display = 'block';
-                isRecording = false;
                 document.getElementById('btn-record').disabled = false;
                 document.getElementById('btn-stop').disabled = true;
                 document.getElementById('record-output').style.display = 'none';
@@ -1722,8 +2154,10 @@
             if (e.target.checked) {
                 currentMode = 'route';
                 odometryOrigin = null;
+                odometryOriginAngle = 0;
                 odometryPoints = [];
                 odometryLines = [];
+                recordedPoints = [];
                 odometryAddMode = null;
                 isRecording = false;
                 document.getElementById('btn-record').disabled = false;
