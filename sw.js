@@ -1,4 +1,4 @@
-const CACHE_NAME = 'odommap-v1';
+const CACHE_NAME = 'odommap-v3';
 const urlsToCache = [
     './',
     './OdomMap.html',
